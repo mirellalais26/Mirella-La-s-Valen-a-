@@ -1,0 +1,291 @@
+%%writefile main.cpp
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <chrono>
+#include <vector>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
+
+#include "Hash.h"
+#include "List.h"
+#include "AVL.h"
+#include "SkipList.h"
+#include "BloomFilter.h"
+#include "ContiguousList.h"
+
+using namespace std;
+
+// Acessando variáveis globais do Hash.c
+extern int TABLE_SIZE;
+extern Entrada* hashLinear;
+
+// ============================================================================
+// FUNÇÃO PARA LIMPAR A ÁRVORE AVL DA MEMÓRIA E EVITAR LEAKS (VALGRIND)
+// ============================================================================
+void liberarAVL(NoAVL* no) {
+    if (no == NULL) return;
+    liberarAVL(no->esq);
+    liberarAVL(no->dir);
+    delete no;
+}
+
+// ============================================================================
+// OP. EXTRA 1: DETECTOR DE ANOMALIAS ESTATÍSTICAS
+// ============================================================================
+class AnomalyDetector {
+    double mean, stddev;
+public:
+    AnomalyDetector() : mean(0), stddev(0) {}
+    void train(const vector<double>& data) {
+        if (data.empty()) return;
+        double sum = 0.0, sq_sum = 0.0;
+        for (double val : data) { sum += val; sq_sum += val * val; }
+        mean = sum / data.size();
+        stddev = sqrt((sq_sum / data.size()) - (mean * mean));
+    }
+    bool detect(double value) {
+        if (stddev == 0) return false;
+        return fabs(value - mean) > 3 * stddev;
+    }
+};
+
+// ============================================================================
+// OP. EXTRA 2: ATUALIZAÇÃO DE REGISTRO (UPDATE) NA HASH
+// ============================================================================
+bool atualizarRegistroHash(const char* chave, double nova_demanda) {
+    Entrada* e = buscarHash_linear(chave);
+    if (e != NULL) {
+        e->demanda_residual = nova_demanda;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// OP. EXTRA 3: ENCONTRAR O MAIOR VALOR (MAX) NA ÁRVORE AVL
+// ============================================================================
+NoAVL* encontrarMaximoAVL(NoAVL* no) {
+    if (no == NULL) return NULL;
+    while (no->dir != NULL) { no = no->dir; }
+    return no;
+}
+
+// ============================================================================
+// CÁLCULO DE COLISÕES
+// ============================================================================
+double calcularTaxaColisoesHash() {
+    int colisoes = 0, ocupados = 0;
+    for (int i = 0; i < TABLE_SIZE; i++) {
+        if (hashLinear != NULL && hashLinear[i].ocupado == 1) {
+            ocupados++;
+            unsigned long hashVal = 5381;
+            for (int j = 0; hashLinear[i].chave[j] != '\0'; j++) {
+                hashVal = ((hashVal << 5) + hashVal) + hashLinear[i].chave[j];
+            }
+            if ((hashVal % TABLE_SIZE) != (unsigned int)i) colisoes++;
+        }
+    }
+    return ocupados == 0 ? 0.0 : ((double)colisoes / ocupados) * 100.0;
+}
+
+// ============================================================================
+// GRÁFICO ASCII
+// ============================================================================
+void desenharGrafico(string nome, double tempo) {
+    cout << left << setw(18) << nome << " | ";
+    int barras = min(40, static_cast<int>(tempo * 8.0));
+    if (barras == 0 && tempo > 0) barras = 1;
+    for(int i = 0; i < barras; i++) cout << "█";
+    cout << " (" << tempo << " ms)" << endl;
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 1: TESTE RÁPIDO DE ESCALABILIDADE
+// ----------------------------------------------------------------------------
+void rodarEscalabilidade(int limite_linhas) {
+    ifstream arquivo("ESK2033.csv");
+    if (!arquivo.is_open()) return;
+    string linha; getline(arquivo, linha);
+
+    NoAVL* raizAVL = NULL; NodeList* headList = NULL;
+    ContiguousList minhaListaContigua(limite_linhas + 100);
+
+    TABLE_SIZE = 1024;
+    inicializarHash();
+
+    int qtd_linhas = 0;
+    double tempo_hash = 0, tempo_avl = 0, tempo_list = 0, tempo_contigua = 0;
+
+    while (getline(arquivo, linha) && qtd_linhas < limite_linhas) {
+        if (linha.empty()) continue;
+        string celula, data_str; double demanda_res = 0.0;
+        int col = 0; stringstream ss(linha); char delim = (linha.find(';') != string::npos) ? ';' : ',';
+
+        while (getline(ss, celula, delim)) {
+            col++; celula.erase(remove(celula.begin(), celula.end(), '\"'), celula.end());
+            if (col == 1) { if (celula.length() >= 99) celula = celula.substr(0, 98); data_str = celula; }
+            else if (col == 9) {
+                for (char& c : celula) { if (c == ',') c = '.'; }
+                try { demanda_res = stod(celula); } catch (...) { demanda_res = 0.0; }
+                break;
+            }
+        }
+
+        Entrada e; strncpy(e.chave, data_str.c_str(), 99); e.demanda_residual = demanda_res;
+        auto start = chrono::high_resolution_clock::now(); inserirHash_linear(&e);
+        tempo_hash += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        start = chrono::high_resolution_clock::now(); raizAVL = inserirAVL(raizAVL, data_str, demanda_res);
+        tempo_avl += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        EletricDates dadoList; strncpy(dadoList.data, data_str.c_str(), 99);
+        start = chrono::high_resolution_clock::now(); in(&headList, &dadoList);
+        tempo_list += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        start = chrono::high_resolution_clock::now(); minhaListaContigua.inserir(data_str, demanda_res);
+        tempo_contigua += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        qtd_linhas++;
+    }
+    arquivo.close();
+    printf("| %-9d | %-9.3f | %-9.3f | %-9.3f | %-9.3f |\n", limite_linhas, tempo_hash, tempo_avl, tempo_contigua, tempo_list);
+
+    // Limpeza de memória anti-leak
+    liberarHashLinear();
+    liberar_lista(&headList);
+    liberarAVL(raizAVL);
+}
+
+// ----------------------------------------------------------------------------
+// MÓDULO 2: BENCHMARK COMPLETO OFICIAL
+// ----------------------------------------------------------------------------
+void rodarBenchmarkCompleto() {
+    ifstream arquivo("ESK2033.csv");
+    if (!arquivo.is_open()) return;
+    string linha; getline(arquivo, linha);
+
+    NoAVL* raizAVL = NULL; NodeList* headList = NULL;
+    SkipList minhaSkipList(16, 0.5); BloomFilter meuBloomFilter(60000);
+    ContiguousList minhaListaContigua(10000);
+
+    TABLE_SIZE = 1024;
+    inicializarHash();
+
+    AnomalyDetector detector;
+    vector<double> dadosParaTreino; vector<string> chavesParaTestes; bool treinado = false;
+
+    double t_h_ins = 0, t_a_ins = 0, t_s_ins = 0, t_b_ins = 0, t_l_ins = 0, t_c_ins = 0;
+    int qtd_linhas = 0;
+
+    cout << "\n🚀 FASE 1: Processando 10.000 registros e alimentando estruturas..." << endl;
+
+    while (getline(arquivo, linha) && qtd_linhas < 10000) {
+        if (linha.empty()) continue;
+        string celula, data_str; double demanda_res = 0.0; int col = 0;
+        char delim = (linha.find(';') != string::npos) ? ';' : ','; stringstream ss(linha);
+
+        while (getline(ss, celula, delim)) {
+            col++; celula.erase(remove(celula.begin(), celula.end(), '\"'), celula.end());
+            if (col == 1) { if (celula.length() >= 99) celula = celula.substr(0, 98); data_str = celula; }
+            else if (col == 9) {
+                for (char& c : celula) { if (c == ',') c = '.'; }
+                if (!celula.empty()) {
+                    try { demanda_res = stod(celula); } catch (...) { demanda_res = 0.0; }
+                    if (!treinado) { dadosParaTreino.push_back(demanda_res); if (dadosParaTreino.size() == 100) { detector.train(dadosParaTreino); treinado = true; } }
+                } break;
+            }
+        }
+        if (qtd_linhas % 100 == 0) chavesParaTestes.push_back(data_str);
+
+        auto start = chrono::high_resolution_clock::now();
+        Entrada entradaHash; strncpy(entradaHash.chave, data_str.c_str(), 99); entradaHash.demanda_residual = demanda_res;
+        inserirHash_linear(&entradaHash); t_h_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        start = chrono::high_resolution_clock::now(); raizAVL = inserirAVL(raizAVL, data_str, demanda_res); t_a_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaSkipList.inserir(data_str, demanda_res); t_s_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); meuBloomFilter.inserir(data_str); t_b_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+
+        start = chrono::high_resolution_clock::now(); EletricDates dadoList; strncpy(dadoList.data, data_str.c_str(), 99); dadoList.demanda_residual = demanda_res; in(&headList, &dadoList); t_l_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaListaContigua.inserir(data_str, demanda_res); t_c_ins += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        qtd_linhas++;
+    } arquivo.close();
+
+    double t_h_bus = 0, t_a_bus = 0, t_s_bus = 0, t_b_bus = 0, t_l_bus = 0, t_c_bus = 0;
+    for (const string& ch : chavesParaTestes) {
+        auto start = chrono::high_resolution_clock::now(); buscarHash_linear(ch.c_str()); t_h_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); buscarAVL(raizAVL, ch); t_a_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaSkipList.buscar(ch); t_s_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); meuBloomFilter.contem(ch); t_b_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); buscar_lista(headList, ch.c_str()); t_l_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaListaContigua.buscar(ch); t_c_bus += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+    }
+
+    double t_h_rem = 0, t_a_rem = 0, t_s_rem = 0, t_l_rem = 0, t_c_rem = 0;
+    for (const string& ch : chavesParaTestes) {
+        auto start = chrono::high_resolution_clock::now(); removerHash_linear(ch.c_str()); t_h_rem += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); raizAVL = removerAVL(raizAVL, ch); t_a_rem += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaSkipList.remover(ch); t_s_rem += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); remover_lista(&headList, ch.c_str()); t_l_rem += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+        start = chrono::high_resolution_clock::now(); minhaListaContigua.remover(ch); t_c_rem += chrono::duration<double, milli>(chrono::high_resolution_clock::now() - start).count();
+    }
+
+    double mem_hash = TABLE_SIZE * sizeof(Entrada);
+    double mem_avl = qtd_linhas * sizeof(NoAVL);
+    double mem_skip = (qtd_linhas * sizeof(SkipNode)) + (qtd_linhas * 2 * sizeof(SkipNode*));
+    double mem_list = qtd_linhas * sizeof(NodeList);
+    double mem_bloom = 60000 * sizeof(bool);
+    double mem_contigua = 10000 * sizeof(RecordContiguo);
+
+    cout << "\n=================================================================================" << endl;
+    cout << "📊 BENCHMARK OPERACIONAL: ESCALABILIDADE, MEMÓRIA E COLISÕES (" << qtd_linhas << " itens)" << endl;
+    cout << "=================================================================================" << endl;
+    cout << "Estrutura          | Inserção   | Busca      | Remoção    | Memória Est. | Teórico   " << endl;
+    cout << "-------------------|------------|------------|------------|--------------|-----------" << endl;
+    printf("1. Tabela Hash     | %7.3f ms | %7.3f ms | %7.3f ms | %7.1f KB   | O(1) médio\n", t_h_ins, t_h_bus, t_h_rem, mem_hash/1024.0);
+    printf("2. Árvore AVL      | %7.3f ms | %7.3f ms | %7.3f ms | %7.1f KB   | O(log N)  \n", t_a_ins, t_a_bus, t_a_rem, mem_avl/1024.0);
+    printf("3. Skip List       | %7.3f ms | %7.3f ms | %7.3f ms | %7.1f KB   | O(log N)  \n", t_s_ins, t_s_bus, t_s_rem, mem_skip/1024.0);
+    printf("4. Lista Encadeada | %7.3f ms | %7.3f ms | %7.3f ms | %7.1f KB   | O(N)      \n", t_l_ins, t_l_bus, t_l_rem, mem_list/1024.0);
+    printf("5. Bloom Filter    | %7.3f ms | %7.3f ms |    N/A     | %7.1f KB   | O(k)      \n", t_b_ins, t_b_bus, mem_bloom/1024.0);
+    printf("6. Lista Otimizada | %7.3f ms | %7.3f ms | %7.3f ms | %7.1f KB   | O(N) prát.\n", t_c_ins, t_c_bus, t_c_rem, mem_contigua/1024.0);
+    cout << "---------------------------------------------------------------------------------" << endl;
+    cout << "⚠️  TAXA DE COLISÕES REAIS NA TABELA HASH: " << fixed << setprecision(2) << calcularTaxaColisoesHash() << "%" << endl;
+    cout << "=================================================================================\n" << endl;
+
+    cout << "📊 GRÁFICO VISUAL: TEMPO ACUMULADO DE BUSCA (QUANTO MENOR, MELHOR)" << endl;
+    cout << "---------------------------------------------------------------------------------" << endl;
+    desenharGrafico("1. Tabela Hash", t_h_bus); desenharGrafico("2. Árvore AVL", t_a_bus);
+    desenharGrafico("3. Skip List", t_s_bus); desenharGrafico("4. Lista Encadeada", t_l_bus);
+    desenharGrafico("5. Bloom Filter", t_b_bus); desenharGrafico("6. Lista Otimizada", t_c_bus);
+    cout << "=================================================================================" << endl;
+
+    // Limpeza de memória anti-leak
+    liberarHashLinear();
+    liberar_lista(&headList);
+    liberarAVL(raizAVL);
+}
+
+int main() {
+    cout << "======================================================================" << endl;
+    cout << "📈 PARTE 1: TESTE DE ESCALABILIDADE (Tempo de Inserção em ms)" << endl;
+    cout << "======================================================================" << endl;
+    cout << "| Elementos | Hash O(1) | AVL O(logN)| Otimizada | Lista O(N)|" << endl;
+    cout << "----------------------------------------------------------------------" << endl;
+
+    rodarEscalabilidade(2500);
+    rodarEscalabilidade(5000);
+    rodarEscalabilidade(10000);
+
+    cout << "======================================================================" << endl;
+    cout << "✅ Op. Extra 1: Detector de Anomalias Estatisticas" << endl;
+    cout << "✅ Op. Extra 2: Função de Atualização (Update) na Hash" << endl;
+    cout << "✅ Op. Extra 3: Função de Busca de Máximo (Max) na AVL" << endl;
+    cout << "======================================================================" << endl;
+
+    rodarBenchmarkCompleto();
+
+    return 0;
+}
